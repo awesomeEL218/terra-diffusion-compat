@@ -56,6 +56,106 @@ public final class BiomeClassifier {
 
     private static final int MAX_SNOW_DEPTH = SNOW_BLOCK_DEPTH + LAYERS_PER_TIER;
 
+    public static final int VAR_TEMPERATURE = 0;
+    
+    public static final int VAR_PRECIPITATION = 1;
+
+    public static final int VAR_ELEVATION = 2;
+
+    public static final int VAR_SLOPE = 3;
+
+    public static final int VAR_COUNT = 4;
+
+    private static final int MAX_POOL = 64;
+
+    public static final short TERRALITH_DYNAMIC_ID = 199;
+
+    public static int varIndex(String name) {
+        switch (name) {
+            case "temperature":   return VAR_TEMPERATURE;
+            case "precipitation": return VAR_PRECIPITATION;
+            case "elevation":     return VAR_ELEVATION;
+            case "slope":         return VAR_SLOPE;
+            default:              return -1;
+        }
+    }
+
+    /**
+     * Compiled form of a biome region. Set by {@code BiomeRegionConfig.buildCompiled()} via
+     * the BiomeSource constructor; read (without locking) in the classify hot loop.
+     */
+    public static final class CompiledRegion {
+        // Per-variable normalization scale for distance computation
+        private static final float[] DIST_SCALES = {60f, 2000f, 6000f, 1.5f};
+
+        public final String name;
+        public final float[] min;         // [VAR_COUNT] inclusive lower bounds
+        public final float[] max;         // [VAR_COUNT] inclusive upper bounds
+        public final short[] biomeIds;    // biome pool
+        public final float[] priorities;  // per-biome priority (parallel to biomeIds)
+
+        public CompiledRegion(String name, float[] min, float[] max, short[] biomeIds, float[] priorities) {
+            this.name = name;
+            this.min = min;
+            this.max = max;
+            this.biomeIds = biomeIds;
+            this.priorities = priorities;
+        }
+
+        public boolean matches(float[] vars) {
+            for (int i = 0; i < VAR_COUNT; i++) {
+                if (vars[i] < min[i] || vars[i] > max[i]) return false;
+            }
+            return true;
+        }
+
+        /** Normalized L1 distance from vars to the nearest point inside this region. */
+        public float distanceTo(float[] vars) {
+            float dist = 0f;
+            for (int i = 0; i < VAR_COUNT; i++) {
+                dist += Math.max(0f, min[i] - vars[i]) / DIST_SCALES[i];
+                dist += Math.max(0f, vars[i] - max[i]) / DIST_SCALES[i];
+            }
+            return dist;
+        }
+    }
+
+     /** Data-driven region array. Written once by the BiomeSource constructor; read-only thereafter. */
+    public static volatile CompiledRegion[] compiledRegions = null;
+
+    /**
+     * Cellular/Voronoi noise and domain-warp noise for spatially-coherent biome patch selection.
+     * Re-initialized by {@link #configureNoise} when biome-regions.json is loaded.
+     * {@code WARP_NOISE} is null when domain warp is disabled (amplitude == 0).
+     */
+    private static volatile FastNoiseLite CELL_NOISE;
+    private static volatile FastNoiseLite WARP_NOISE;
+    private static final ThreadLocal<FastNoiseLite.Vector2> WARP_COORD =
+        ThreadLocal.withInitial(() -> new FastNoiseLite.Vector2(0f, 0f));
+
+ public static void configureNoise(float cellScale, float warpScale, float warpAmp,
+                                      int warpOctaves, float warpLacunarity, float warpGain) {
+        FastNoiseLite cell = new FastNoiseLite(22222);
+        cell.SetNoiseType(FastNoiseLite.NoiseType.Cellular);
+        cell.SetFrequency(1f / Math.max(1f, cellScale));
+        cell.SetCellularReturnType(FastNoiseLite.CellularReturnType.CellValue);
+        CELL_NOISE = cell;
+
+        if (warpAmp == 0f) {
+            WARP_NOISE = null;
+        } else {
+            FastNoiseLite warp = new FastNoiseLite(33333);
+            warp.SetDomainWarpType(FastNoiseLite.DomainWarpType.OpenSimplex2);
+            warp.SetFrequency(1f / Math.max(1f, warpScale));
+            warp.SetDomainWarpAmp(warpAmp);
+            warp.SetFractalType(FastNoiseLite.FractalType.DomainWarpProgressive);
+            warp.SetFractalOctaves(Math.max(1, warpOctaves));
+            warp.SetFractalLacunarity(warpLacunarity);
+            warp.SetFractalGain(warpGain);
+            WARP_NOISE = warp;
+        }
+    }
+
     // Biome IDs
     static final short PLAINS = 1, RIVER = 7, FROZEN_RIVER = 11;
     static final short SNOWY_PLAINS = 3, DESERT = 5, SWAMP = 6;
@@ -109,6 +209,16 @@ public final class BiomeClassifier {
         // Process per-pixel
         TerrainSample sample = new TerrainSample();
         boolean useTerralith = TerralithCompat.isActive();
+
+        // Pool scratch arrays
+        short[] poolBiomes = new short[MAX_POOL];
+        float[] poolPriSum = new float[MAX_POOL];
+        int[]   poolCount  = new int[MAX_POOL];
+        float[] vars       = new float[BiomeClassifier.VAR_COUNT];
+
+        BiomeClassifier.CompiledRegion[] regions = BiomeClassifier.compiledRegions;
+        FastNoiseLite cellNoise = BiomeClassifier.CELL_NOISE;
+        FastNoiseLite warpNoise = BiomeClassifier.WARP_NOISE;
 
         for (int r = 0; r < H; r++) {
             for (int c = 0; c < W; c++) {
@@ -235,14 +345,11 @@ public final class BiomeClassifier {
                 short biome;
                 if (!sample.isOcean && riverMask != null && riverMask[idx]) {
                     biome = riverBiome(sample, useTerralith);
+                } else if (regions == null || regions.length == 0) {
+                    biome = useTerralith ? TerralithClassifier.pick(sample) : TerralithClassifier.NONE;
+                    if (biome == TerralithClassifier.NONE) biome = classifyVanilla(sample);
                 } else {
-                    biome = TerralithClassifier.NONE;
-                    if (useTerralith) {
-                        biome = TerralithClassifier.pick(sample);
-                    }
-                    if (biome == TerralithClassifier.NONE) {
-                        biome = classifyVanilla(sample);
-                    }
+                    biome = classifyPooled(sample, vars, regions, poolBiomes, poolPriSum, poolCount, cellNoise, warpNoise, useTerralith);    
                 }
 
                 out[idx] = biome;
@@ -253,6 +360,86 @@ public final class BiomeClassifier {
         }
         return out;
     }
+    private static short classifyPooled(TerrainSample sample, float[] vars, BiomeClassifier.CompiledRegion[] regions, short[] poolBiomes, float[] poolPriSum, int[] poolCount, FastNoiseLite cellNoise, FastNoiseLite warpNoise, boolean useTerralith) {
+           vars[BiomeClassifier.VAR_TEMPERATURE] = sample.temp;
+           vars[BiomeClassifier.VAR_PRECIPITATION] = sample.precip;
+           vars[BiomeClassifier.VAR_ELEVATION] = sample.elev;
+           vars[BiomeClassifier.VAR_SLOPE] = sample.slope;
+           
+           int poolSize = 0;
+
+           for (BiomeClassifier.CompiledRegion region : regions) {
+            if (!region.matches(vars)) continue;
+
+            for (int k = 0; k < region.biomeIds.length && poolSize < poolBiomes.length; k++) {
+              short bid = region.biomeIds[k];
+              float pri = region.priorities [k];
+
+              if (bid == TERRALITH_DYNAMIC_ID) {
+                short pick = TerralithClassifier.pick(sample);
+                bid = pick;
+            }
+              int found = -1;
+            for (int p = 0; p < poolSize; p++) {
+                if (poolBiomes[p] == bid) { found = p; break; }
+            }
+            if (found >= 0) {
+                poolPriSum[found] += pri;
+                poolCount[found]++;
+            } else {
+                poolBiomes[poolSize] = bid;
+                poolPriSum[poolSize] = pri;
+                poolCount[poolSize]  = 1;
+                poolSize++;
+            }
+        }}
+          // Fall back to closest region when no region matches.
+                if (poolSize == 0) {
+                    float bestDist = Float.MAX_VALUE;
+                    int bestIdx = -1;
+                    for (int ri = 0; ri < regions.length; ri++) {
+                        if (regions[ri].biomeIds.length == 0) continue;
+                        float d = regions[ri].distanceTo(vars);
+                        if (d < bestDist) { bestDist = d; bestIdx = ri; }
+                    }
+                    if (bestIdx >= 0) {
+                        CompiledRegion closest = regions[bestIdx];
+                        for (int k = 0; k < closest.biomeIds.length && poolSize < MAX_POOL; k++) {
+                            poolBiomes[poolSize] = closest.biomeIds[k];
+                            poolPriSum[poolSize] = closest.priorities[k];
+                            poolCount[poolSize]  = 1;
+                            poolSize++;
+                        }
+                    }
+                }
+                      short biome;
+        if (poolSize == 0) {
+            biome = PLAINS;
+        } else {
+            float total = 0f;
+            for (int p = 0; p < poolSize; p++) {
+                poolPriSum[p] /= poolCount[p];
+                total += poolPriSum[p];
+            }
+            float cx = sample.worldX, cy = sample.worldZ;
+            if (warpNoise != null) {
+                FastNoiseLite.Vector2 coord = WARP_COORD.get();
+                coord.x = cx; coord.y = cy;
+                warpNoise.DomainWarp(coord);
+                cx = coord.x; cy = coord.y;
+            }
+            float cellVal = (cellNoise.GetNoise(cx, cy) + 1f) * 0.5f; // [0, 1]
+            float target  = cellVal * total;
+            float cumul   = 0f;
+            biome = poolBiomes[poolSize - 1];
+            for (int p = 0; p < poolSize; p++) {
+                cumul += poolPriSum[p];
+                if (cumul >= target) { biome = poolBiomes[p]; break; }
+            }
+        }
+        return biome;
+    }
+
 
     private static byte snowDepthFor(TerrainSample s) {
         float temp = s.temp;

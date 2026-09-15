@@ -5,6 +5,9 @@ import net.minecraft.server.level.ServerLevel;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.loading.FMLPaths;
+import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
+import com.github.xandergos.terraindiffusionmc.config.BiomeRegionConfig;
+import com.github.xandergos.terraindiffusionmc.world.TerrainDiffusionBiomeSource;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.neoforged.neoforge.event.level.LevelEvent;
@@ -13,6 +16,7 @@ import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.registries.RegisterEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.github.xandergos.terraindiffusionmc.world.RiverFlowFixer;
 
 @Mod(TerrainDiffusionMc.FML_MOD_ID)
 public class TerrainDiffusionMc {
@@ -23,10 +27,12 @@ public class TerrainDiffusionMc {
     public TerrainDiffusionMc(IEventBus modEventBus) {
         LOG.info("Initializing terrain-diffusion-mc for NeoForge");
         modEventBus.addListener(this::onRegister);
+        modEventBus.addListener(this::onCommonSetup);
         TerrainDiffusionLifecycle.bootstrap(FMLPaths.CONFIGDIR.get(), FMLPaths.GAMEDIR.get());
 
         NeoForge.EVENT_BUS.addListener(this::onServerStarting);
         NeoForge.EVENT_BUS.addListener(this::onLevelLoad);
+        NeoForge.EVENT_BUS.addListener(RiverFlowFixer::onChunkLoad);
         NeoForge.EVENT_BUS.addListener(this::onServerStopping);
         NeoForge.EVENT_BUS.addListener(this::onRegisterCommands);
     }
@@ -39,7 +45,16 @@ public class TerrainDiffusionMc {
         event.register(Registries.FEATURE, helper ->
                 TerrainDiffusionLifecycle.registerFeatures(helper::register));
     }
+    private void onCommonSetup(FMLCommonSetupEvent event) {
+    LOG.info("onCommonSetup firing");
+    BiomeRegionConfig.load();
 
+    TerrainDiffusionBiomeSource.setRegionProvider(biomeLookup -> {
+        BiomeRegionConfig.BuildResult r = BiomeRegionConfig.buildCompiled(biomeLookup);
+        return r == null ? null
+            : new TerrainDiffusionBiomeSource.RegionBuildResult(r.regions, r.additionalBiomes);
+    });
+}
     private void onServerStarting(ServerStartingEvent event) {
         TerrainDiffusionLifecycle.onServerStarting();
     }

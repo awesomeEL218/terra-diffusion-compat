@@ -21,6 +21,7 @@ import net.minecraft.world.level.biome.BiomeSource;
 import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.biome.Climate;
 
+import com.github.xandergos.terraindiffusionmc.pipeline.BiomeClassifier;
 import com.github.xandergos.terraindiffusionmc.pipeline.CaveBiomes;
 import com.github.xandergos.terraindiffusionmc.pipeline.TerralithBiomeIds;
 import com.github.xandergos.terraindiffusionmc.pipeline.TerralithCompat;
@@ -53,6 +54,15 @@ public class TerrainDiffusionBiomeSource extends BiomeSource {
     private Map<Short, Holder<Biome>> biomeIdMap = null;
     private Holder<Biome>[] caveBiomes = null;
     private boolean caveTerralith = false;
+
+    public record RegionBuildResult(BiomeClassifier.CompiledRegion[] regions,
+                                 Map<Short, Holder<Biome>> additionalBiomes) {}
+
+private static java.util.function.Function<HolderGetter<Biome>, RegionBuildResult> regionProvider = null;
+
+public static void setRegionProvider(java.util.function.Function<HolderGetter<Biome>, RegionBuildResult> provider) {
+    regionProvider = provider;
+}
 
     public TerrainDiffusionBiomeSource(HolderGetter<Biome> biomeLookup) {
         this.biomeLookup = biomeLookup;
@@ -97,6 +107,15 @@ public class TerrainDiffusionBiomeSource extends BiomeSource {
         ));
 
         addTerralithBiomes(biomes);
+
+        if (regionProvider != null) {
+            RegionBuildResult result = regionProvider.apply(this.biomeLookup);
+            if (result != null) {
+                BiomeClassifier.compiledRegions = result.regions();
+                biomes.putAll(result.additionalBiomes());
+            }
+        }
+
         biomeIdMap = Map.copyOf(biomes);
         resolveCaveBiomes();
     }

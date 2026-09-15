@@ -1,0 +1,23 @@
+Oceans: no terralith biomes, made skylands spawnable
+
+Steep Rocky: priority 2, just as common as BWG
+
+High Mountain Frozen: priority 4, somewhat common
+
+High Mountain Cool: priority 3, somewhat common
+
+Frozen Tundra: priority 4, slightly more common than BWG
+
+Boreal Forest: priority 4, more common that BWG
+
+Temperate Dry: priority 2, just as common as BWG, made vanilla biome 6 -> 4 (less common)
+
+Temperate Forest: priority 2, just as common as BWG
+
+Warn Dry: priority 3, just as common as BWG
+
+Warm Moist: priority 2, just as common as BWG
+
+Hot Desert: priority 3, just as common as BWG
+
+Tropical Jungle: priority 3, just as common as BWG
